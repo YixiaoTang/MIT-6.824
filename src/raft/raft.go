@@ -46,8 +46,8 @@ import (
 //
 
 const voteForNone = -1
-const heartbeatTime = 100
-const electionTimeout = 400
+const heartbeatTime = 200
+const electionTimeout = 600
 const checkInterval = 10
 const follower = "Follorer"
 const leader = "Leader"
@@ -81,7 +81,7 @@ type Raft struct {
 	VoteFor                int
 	Logs                   []LogEntry
 	commitIndex            int
-	lastApplied            int
+	LastApplied            int
 	Role                   string
 	nextIndex              []int
 	matchIndex             []int
@@ -129,6 +129,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.VoteFor)
 	e.Encode(rf.Logs)
 	e.Encode(rf.Role)
+	e.Encode(rf.LastApplied)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -148,16 +149,19 @@ func (rf *Raft) readPersist(data []byte) {
 	var VoteFor int
 	var Logs []LogEntry
 	var Role string
+	var LastApplied int
 	if d.Decode(&CurrentTerm) != nil ||
 		d.Decode(&VoteFor) != nil ||
 		d.Decode(&Logs) != nil ||
-		d.Decode(&Role) != nil {
+		d.Decode(&Role) != nil ||
+		d.Decode(&LastApplied) != nil {
 		fmt.Println("readPersist fail")
 	} else {
 		rf.CurrentTerm = CurrentTerm
 		rf.VoteFor = VoteFor
 		rf.Logs = Logs
 		rf.Role = Role
+		//rf.LastApplied = LastApplied  comment to avoid unexpected bug
 	}
 }
 
@@ -195,8 +199,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	ConflictIndex int
+	ConflictTerm  int
+	Term          int
+	Success       bool
 }
 
 func (rf *Raft) getLastLog() LogEntry {
@@ -226,7 +232,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.LastLogTerm < lastLog.Term {
 		reply.VoteGranted = false
 	} else {
-		if args.LastLogTerm > lastLog.Term || args.LastLogIndex >= lastLog.Index {
+		if args.LastLogTerm > lastLog.Term || (args.LastLogIndex >= lastLog.Index && args.LastLogTerm == lastLog.Term) {
 			reply.VoteGranted = true
 			rf.VoteFor = args.CandidateID
 			rf.lastRPCTime = time.Now()
@@ -255,19 +261,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	isContainLastLog := false
 	var i int
 	for i = len(rf.Logs) - 1; i >= 0; i-- {
-		if rf.Logs[i].Term < args.PrecLogTerm {
-			isContainLastLog = false
-			break
-		}
 		if rf.Logs[i].Term == args.PrecLogTerm && rf.Logs[i].Index == args.PrevLogIndex {
+			reply.ConflictIndex = -1
+			reply.ConflictTerm = -1
 			isContainLastLog = true
 			break
 		}
+		if rf.Logs[i].Index == args.PrevLogIndex && rf.Logs[i].Term != args.PrecLogTerm {
+			reply.ConflictTerm = rf.Logs[i].Term
+			isContainLastLog = false
+			for i > 0 {
+				if rf.Logs[i].Term == reply.ConflictTerm && rf.Logs[i-1].Term != reply.ConflictTerm {
+					reply.ConflictIndex = rf.Logs[i].Index
+					break
+				}
+				i--
+			}
+			break
+		}
+		if rf.Logs[i].Index < args.PrevLogIndex {
+			isContainLastLog = false
+			reply.ConflictTerm = -1
+			reply.ConflictIndex = len(rf.Logs)
+			break
+		}
+
 	}
 	//fmt.Printf("success=%v, PrecLogTerm=%d, PrevLogIndex=%d, log=%d, nextIndex=%v, from %d to %d\n", isContainLastLog, args.PrecLogTerm, args.PrevLogIndex, rf.log, rf.nextIndex, args.LeaderID, rf.me)
-	if args.PrevLogIndex == 0 && !isContainLastLog {
-		fmt.Println("Wrong!")
-	}
 	reply.Success = isContainLastLog
 	if !isContainLastLog {
 		return
@@ -287,7 +307,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if len(args.Entries) > 0 {
 			rf.commitIndex = min(args.LeaderCommit, args.Entries[len(args.Entries)-1].Index)
 		} else {
-			rf.commitIndex = min(args.LeaderCommit, rf.getLastLog().Index)
+			rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex)
 		}
 
 	}
@@ -359,17 +379,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.Role == leader
 	if isLeader {
 		rf.mu.Lock()
-		Logs := LogEntry{
+		log := LogEntry{
 			Term:  rf.CurrentTerm,
 			Index: rf.getLastLog().Index + 1,
 			Logs:  command,
 		}
-		rf.Logs = append(rf.Logs, Logs)
+		DPrintf("Leader %d receive cmd = %v\n", rf.me, log.Logs)
+		rf.Logs = append(rf.Logs, log)
 		rf.persist()
-		rf.matchIndex[rf.me] = Logs.Index
-		rf.nextIndex[rf.me] = Logs.Index + 1
-		index = Logs.Index
-		term = Logs.Term
+		rf.matchIndex[rf.me] = log.Index
+		rf.nextIndex[rf.me] = log.Index + 1
+		index = log.Index
+		term = log.Term
 		rf.mu.Unlock()
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me && rf.getLastLog().Index >= rf.nextIndex[i] {
@@ -409,10 +430,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 								return
 							}
 
-							rf.nextIndex[server]--
+							rf.nextIndex[server] = rf.optimizedBacktracking(reply)
 							rf.mu.Unlock()
 						} else {
-							return
+							time.Sleep(10 * time.Millisecond)
 						}
 					}
 				}(i)
@@ -421,6 +442,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	// Your code here (2B).
 	return index, term, isLeader
+}
+
+func (rf *Raft) optimizedBacktracking(reply AppendEntriesReply) int {
+	if reply.ConflictTerm == -1 {
+		return reply.ConflictIndex
+	}
+	for i := len(rf.Logs) - 1; i >= 0; i-- {
+		if rf.Logs[i].Term == reply.ConflictTerm && rf.Logs[i+1].Term != reply.ConflictTerm {
+			return rf.Logs[i].Index
+		}
+	}
+	return reply.ConflictIndex
 }
 
 //
@@ -520,7 +553,7 @@ func (rf *Raft) election() {
 func (rf *Raft) heartbeat(server int) {
 	for {
 		if rf.Role != leader {
-			DPrintf("Server %d is not leader\n", rf.me)
+			//DPrintf("Server %d is not leader\n", rf.me)
 			return
 		}
 		rf.mu.Lock()
@@ -551,7 +584,7 @@ func (rf *Raft) heartbeat(server int) {
 					return
 				}
 				rf.mu.Lock()
-				rf.nextIndex[server]--
+				rf.nextIndex[server] = rf.optimizedBacktracking(reply)
 				rf.mu.Unlock()
 			}
 
@@ -562,21 +595,22 @@ func (rf *Raft) heartbeat(server int) {
 
 func (rf *Raft) applyLog() {
 	for {
-		if rf.commitIndex > rf.lastApplied {
+		if rf.commitIndex > rf.LastApplied {
 			rf.mu.Lock()
-			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			for i := rf.LastApplied + 1; i <= rf.commitIndex; i++ {
 				applyMsg := ApplyMsg{
 					CommandValid: true,
 					Command:      rf.Logs[i].Logs,
 					CommandIndex: i,
 				}
-				DPrintf("Server %d apply log index = %d\n", rf.me, i)
+				DPrintf("Server %d apply log index = %d, cmd = %v\n", rf.me, i, applyMsg.Command)
 				rf.mu.Unlock()
 				rf.applyCh <- applyMsg
+				rf.LastApplied = i
 				rf.mu.Lock()
 				//DPrintf("-------------\n")
 			}
-			rf.lastApplied = rf.commitIndex
+
 			rf.mu.Unlock()
 		}
 		time.Sleep(checkInterval * time.Millisecond)
@@ -625,7 +659,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.VoteFor = voteForNone
 	rf.lastRPCTime = time.Now()
 	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.LastApplied = 0
 	rf.receivedVoteNum = 0
 	rf.receivedGrantedVoteNum = 0
 	rf.Role = follower
