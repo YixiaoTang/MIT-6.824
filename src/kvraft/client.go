@@ -1,12 +1,17 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
 
+	"../labrpc"
+)
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
+	servers      []*labrpc.ClientEnd
+	clientID     int64
+	opIndex      int64
+	leaderServer int
 	// You will have to modify this struct.
 }
 
@@ -20,6 +25,8 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.clientID = nrand()
+	ck.leaderServer = -1
 	// You'll have to add code here.
 	return ck
 }
@@ -37,8 +44,29 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
+	args := GetArgs{
+		Key:      key,
+		ClientID: ck.clientID,
+		OpIndex:  nrand(),
+	}
+	reply := GetReply{}
+	for {
+		if ck.leaderServer == -1 {
+			for i := 0; i < len(ck.servers); i++ {
+				ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+				if ok && reply.Success {
+					ck.leaderServer = i
+					return reply.Value
+				}
+			}
+		} else {
+			ok := ck.servers[ck.leaderServer].Call("KVServer.Get", &args, &reply)
+			if ok && reply.Success {
+				return reply.Value
+			}
+			ck.leaderServer = -1
+		}
+	}
 	return ""
 }
 
@@ -53,12 +81,36 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args := PutAppendArgs{
+		ClientID: ck.clientID,
+		OpIndex:  nrand(),
+		Op:       op,
+		Key:      key,
+		Value:    value,
+	}
+	reply := PutAppendReply{}
+	for {
+		if ck.leaderServer == -1 {
+			for i := 0; i < len(ck.servers); i++ {
+				ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+				if ok && reply.Success {
+					ck.leaderServer = i
+					return
+				}
+			}
+		} else {
+			ok := ck.servers[ck.leaderServer].Call("KVServer.PutAppend", &args, &reply)
+			if ok && reply.Success {
+				return
+			}
+			ck.leaderServer = -1
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, PutOp)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, AppendOp)
 }

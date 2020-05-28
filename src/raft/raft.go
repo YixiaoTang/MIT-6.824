@@ -400,13 +400,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							return
 						}
 						rf.mu.Lock()
+						var i int
+						for i = len(rf.Logs) - 1; i > 1; i-- {
+							if rf.Logs[i].Index == rf.nextIndex[server] {
+								break
+							}
+						}
 						args := AppendEntriesArgs{
 							Term:         rf.CurrentTerm,
 							LeaderID:     rf.me,
 							LeaderCommit: rf.commitIndex,
-							PrevLogIndex: rf.Logs[rf.nextIndex[server]-1].Index,
-							PrecLogTerm:  rf.Logs[rf.nextIndex[server]-1].Term,
-							Entries:      rf.Logs[rf.nextIndex[server]:],
+							PrevLogIndex: rf.Logs[i-1].Index,
+							PrecLogTerm:  rf.Logs[i-1].Term,
+							Entries:      rf.Logs[i:],
 						}
 						rf.mu.Unlock()
 						reply := AppendEntriesReply{}
@@ -417,8 +423,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						if ok {
 							if reply.Success {
 								rf.mu.Lock()
-								rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-								rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+								rf.nextIndex[server] = args.Entries[len(args.Entries)-1].Index + 1
+								rf.matchIndex[server] = args.Entries[len(args.Entries)-1].Index
 								rf.mu.Unlock()
 								return
 							}
@@ -445,10 +451,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) optimizedBacktracking(reply AppendEntriesReply) int {
+	// if reply.ConflictIndex == 0 {
+	// 	return 1 //Hardcode to avoid out of range bug
+	// }
 	if reply.ConflictTerm == -1 {
 		return reply.ConflictIndex
 	}
-	for i := len(rf.Logs) - 1; i >= 0; i-- {
+	for i := len(rf.Logs) - 1; i > 0; i-- {
 		if rf.Logs[i].Term == reply.ConflictTerm && rf.Logs[i+1].Term != reply.ConflictTerm {
 			return rf.Logs[i].Index
 		}
@@ -575,7 +584,7 @@ func (rf *Raft) heartbeat(server int) {
 
 			} else {
 				if reply.Term > args.Term {
-					DPrintf("Server %d go back to follower cause heratbeat from server %d.\n", rf.me, server)
+					DPrintf("Server %d go back to follower cause heartbeat from server %d.\n", rf.me, server)
 					rf.mu.Lock()
 					rf.VoteFor = voteForNone
 					rf.Role = follower

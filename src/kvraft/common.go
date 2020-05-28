@@ -16,18 +16,24 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientID int64
+	OpIndex  int64
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err     Err
+	Success bool
 }
 
 type GetArgs struct {
-	Key string
+	Key      string
+	ClientID int64
+	OpIndex  int64
 	// You'll have to add definitions here.
 }
 
 type GetReply struct {
-	Err   Err
-	Value string
+	Err     Err
+	Value   string
+	Success bool
 }

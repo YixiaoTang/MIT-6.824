@@ -1,15 +1,23 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
+	"fmt"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
+const PutOp = "Put"
+const GetOp = "Get"
+const AppendOp = "Append"
+const IsNotLeader = "Is not the leader"
+const TimeOut = "Timeout"
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +26,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op       string
+	Key      string
+	Value    string
+	ClientID int64
+	OpIndex  int64
+}
+
+type opResult struct {
+	op       string
+	clientID int64
+	opIndex  int64
+	value    string
 }
 
 type KVServer struct {
@@ -32,18 +51,85 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
-
+	maxraftstate    int // snapshot if log grows this big
+	storage         map[string]string
+	clientResultMap map[int64]opResult
 	// Your definitions here.
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	clientResult, ok := kv.clientResultMap[args.ClientID]
+	kv.mu.Unlock()
+	if ok && clientResult.opIndex == args.OpIndex {
+		reply.Success = true
+		reply.Value = clientResult.value
+		return
+	}
+	op := Op{
+		Op:       GetOp,
+		Key:      args.Key,
+		ClientID: args.ClientID,
+		OpIndex:  args.OpIndex,
+	}
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Success = false
+		reply.Err = IsNotLeader
+		return
+	}
+	t0 := time.Now()
+	for time.Since(t0).Seconds() < 2 {
+		time.Sleep(10 * time.Millisecond)
+		kv.mu.Lock()
+		clientResult, ok := kv.clientResultMap[args.ClientID]
+		kv.mu.Unlock()
+		if ok && clientResult.opIndex == args.OpIndex {
+			reply.Success = true
+			reply.Value = clientResult.value
+			return
+		}
+	}
+	reply.Success = false
+	reply.Err = TimeOut
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	clientResult, ok := kv.clientResultMap[args.ClientID]
+	kv.mu.Unlock()
+	if ok && clientResult.opIndex == args.OpIndex {
+		reply.Success = true
+		return
+	}
+	op := Op{
+		Op:       args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+		ClientID: args.ClientID,
+		OpIndex:  args.OpIndex,
+	}
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Success = false
+		reply.Err = IsNotLeader
+		return
+	}
+	t0 := time.Now()
+	for time.Since(t0).Seconds() < 2 {
+		time.Sleep(10 * time.Millisecond)
+		kv.mu.Lock()
+		clientResult, ok := kv.clientResultMap[args.ClientID]
+		kv.mu.Unlock()
+		if ok && clientResult.opIndex == args.OpIndex {
+			reply.Success = true
+			return
+		}
+	}
+	reply.Success = false
+	reply.Err = TimeOut
 }
 
 //
@@ -65,6 +151,45 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) apply() {
+	for {
+		applyMsg := <-kv.applyCh
+		kv.mu.Lock()
+		op, ok := applyMsg.Command.(Op)
+		if ok {
+			clientResult, ok2 := kv.clientResultMap[op.ClientID]
+			if !(ok2 && clientResult.opIndex == op.OpIndex) {
+				switch op.Op {
+				case GetOp:
+					kv.clientResultMap[op.ClientID] = opResult{
+						op:       GetOp,
+						clientID: op.ClientID,
+						opIndex:  op.OpIndex,
+						value:    kv.storage[op.Key],
+					}
+				case PutOp:
+					kv.storage[op.Key] = op.Value
+					kv.clientResultMap[op.ClientID] = opResult{
+						op:       PutOp,
+						clientID: op.ClientID,
+						opIndex:  op.OpIndex,
+					}
+				case AppendOp:
+					kv.storage[op.Key] = kv.storage[op.Key] + op.Value
+					kv.clientResultMap[op.ClientID] = opResult{
+						op:       AppendOp,
+						clientID: op.ClientID,
+						opIndex:  op.OpIndex,
+					}
+				}
+			}
+		} else {
+			fmt.Println("applyMsg.Command convertion failed.")
+		}
+		kv.mu.Unlock()
+	}
 }
 
 //
@@ -91,10 +216,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
+	kv.storage = make(map[string]string)
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.clientResultMap = make(map[int64]opResult)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	go kv.apply()
 	// You may need initialization code here.
 
 	return kv
